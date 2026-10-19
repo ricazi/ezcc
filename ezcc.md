@@ -38,30 +38,55 @@ nome extraído contra a lista de nomes de abas.
   olhando o valor e o histórico de pagamentos daquele cliente antes de aplicar.
 - Confiança < 0.80: não aplicar automaticamente. Reunir esses casos e perguntar ao Ricardo
   (nome do extrato + os 2–3 candidatos mais prováveis de aba).
-- Manter uma lista de bloqueio (nomes que já se provaram errados em sessões anteriores) e nunca
-  reautorizar esse match sem confirmação explícita:
+- Nomes do extrato que **não têm aba e devem ser ignorados** (o controle deles já fica
+  centralizado no próprio Asaas — confirmado pelo Ricardo em 19/10/2026):
   - ELIAS RIBEIRO FERNANDES
   - SAMARA GOTTEMS DONATTI
-  - ASSOC DOS PRODUTORES DE HORTIGRANJEIROS DE SANTA ROSA
-- Nomes de aba que já causaram dúvida antes e foram resolvidos manualmente pelo Ricardo (não
-  reabrir a dúvida, usar o nome de aba já correto):
-  - "TARIFA ZERO TELECOM LTDA" (no extrato) = aba "TARIFA ZERO TELECOM LTDA" (renomeada em
-    2026-09; antes era "TARIFA ZERO CONSULTORIA LTDA")
-  - "ASSOCIACAO DE AMIGOS BALNEARIO PILATTI DE PORTO MAUA - RS" (no extrato) = aba
-    "ASSOCIAÇÃO BALNEÁRIO PILATTI"
+- Mapeamentos já confirmados pelo Ricardo (usar direto, sem perguntar e sem depender do fuzzy):
+
+  | Nome no extrato Asaas | Aba da planilha |
+  |---|---|
+  | TARIFA ZERO TELECOM LTDA | TARIFA ZERO TELECOM LTDA (renomeada em 2026-09; antes "TARIFA ZERO CONSULTORIA LTDA") |
+  | ASSOCIACAO DE AMIGOS BALNEARIO PILATTI DE PORTO MAUA - RS | ASSOCIAÇÃO BALNEÁRIO PILATTI |
+  | ASSOC DOS PRODUTORES DE HORTIGRANJEIROS DE SANTA ROSA | APRHOROSA (confirmado em 19/10/2026 — antes estava na lista de bloqueio porque o fuzzy casava errado) |
+  | ASSOCIACAO DE FAM. E AMIGOS DE PESS. NECES. ESPECIAIS | AFAPENE |
+  | ASSOCIACAO SANTA-ROSENSE DE ORNITOLOGOS AMADORES | ASOA |
+  | ASSOCIACAO CASA ROTARIA DOS CLUBES DE ROTARY DE SANTA ROSA - RS | ASSOCIAÇÃO CASA ROTÁRIA |
+  | ZENZEN INDUSTRIA DE ESQUADRIAS DE PVC LTDA | ZENZEN ESQUADRIAS DE PVC LTDA (fuzzy dá 0,79) |
+  | STARTSYNC PRODUTORA DE FILMES LTDA | 604 MEDIA HOUSE LTDA (nome antigo da mesma empresa) |
+  | JOAO C. JUNGES, JOELMIR G. WINCK, VANDO K. HARTMANN E VOLMIR F. PASCH LTDA | aba de mesmo nome. A aba **LEGVITA** é uma cópia antiga do mesmo cliente e não é atualizada — não lançar nela e não incluí-la no relatório |
+
+- Para o fuzzy, normalizar antes de comparar (tirar acentos, pontuação e sufixos LTDA/ME/EPP/
+  EIRELI/CIA). Com isso quase todos os nomes dão ≥ 0,90.
 
 ## Passo 3 — Lógica de reconciliação por aba ("janela" + duplicatas)
 
 Para cada aba de cliente afetada pelo extrato (ou toda aba, se for uma varredura completa):
 
 ### 3a. Reconciliação por janela (window zip)
+0. **Competência de cada linha REC = a da linha de cobrança logo acima dela**, não o texto da
+   própria linha REC — os rótulos REC às vezes estão trocados (ex.: "REC HONORARIOS 082026"
+   logo abaixo de "HONORARIOS 072026"). Uma linha totalmente em branco logo abaixo de uma linha
+   de cobrança de honorários também conta como linha REC (preencher o rótulo
+   "REC HONORARIOS MMAAAA" junto com data e valor — a fórmula de saldo já existe nela).
+   Linhas REC abaixo de cobranças que não são honorários (ABERTURA, ALTERAÇÃO CNPJ, serviço
+   avulso) não entram na janela.
 1. Identificar todas as linhas "REC HONORARIOS MM/AAAA" cuja **vencimento** (competência + 1
    mês) caia dentro do período coberto pelo extrato atual (ex.: se o extrato cobre
    julho–setembro/2026, a janela é vencimento em jul/ago/set 2026).
 2. Pegar os pagamentos do extrato casados com confiança a essa aba, ordenados por data.
-3. Ordenar as linhas REC da janela por ordem de competência (mais antiga primeiro).
-4. Fazer o "zip" 1-para-1: o pagamento mais antigo vai na linha REC de competência mais antiga
-   dentro da janela, e assim por diante — sobrescrevendo qualquer coisa que já estivesse lá.
+   **Antes do zip, tirar os pagamentos que já estão lançados** em qualquer linha REC da aba
+   (mesmo valor com tolerância de ~2%, data até 7 dias de diferença) — inclusive em linhas de
+   serviço (ex.: parcela de alteração de CNPJ da 604 MEDIA, R$ 301,49 no Asaas x R$ 300,00
+   lançado). Esses ficam como estão.
+3. Ordenar as linhas REC da janela por ordem de competência (mais antiga primeiro). Só são
+   "vagas" as linhas REC da janela que estão **vazias** ou que contêm uma **duplicata** (mesma
+   data e valor de outra linha REC acima — é o bug sistêmico). Linhas da janela já preenchidas
+   corretamente (ex.: pagamento de agosto feito antes do período do extrato) **não** são
+   sobrescritas.
+4. Fazer o "zip" 1-para-1: o pagamento restante mais antigo vai na vaga de competência mais
+   antiga, e assim por diante.
+   Se sobrar uma vaga que era duplicata e não recebeu pagamento, limpar (data e valor).
 5. Se sobrarem linhas REC da janela sem pagamento correspondente (menos pagamentos que linhas):
    deixar essas linhas em branco (cliente ainda não pagou aquela competência) — não inventar
    valor.
@@ -72,13 +97,18 @@ Para cada aba de cliente afetada pelo extrato (ou toda aba, se for uma varredura
    sem bater exatamente com a mensalidade padrão — só o Ricardo sabia a qual competência cada
    um se referia).
 
-### 3b. Duplicatas em toda a aba (fora da janela também)
-Independente da janela acima, varrer TODAS as linhas REC da aba e procurar pares com a MESMA
-data e MESMO valor (duplicata exata). Quando encontrar:
-- Manter a linha de menor número (a primeira).
-- Limpar (data E valor) as demais linhas duplicadas, mesmo que estejam fora da janela do
-  extrato atual — esse é o bug sistêmico original (um valor de pagamento colado por engano em
-  uma linha de competência futura ainda não vencida).
+### 3b. Duplicatas em competências futuras
+Varrer as linhas REC da aba e procurar pares com a MESMA data e MESMO valor (duplicata exata).
+- **Limpar** (data E valor) a duplicata quando ela está numa competência **futura** (ainda não
+  vencida, ex.: 10/2026 num extrato até 18/10/2026) **e** esse pagamento (data+valor) aparece
+  no extrato do Asaas — é o bug sistêmico (pagamento colado por engano na competência
+  seguinte). Manter a linha de menor número.
+- **Não limpar** duplicatas cujo pagamento não está no extrato do Asaas: podem ser
+  adiantamento pago pelo banco. Ex.: AFAPENE pagou adiantado em 25/09/2026 pelo Sicredi e o
+  valor aparece repetido nas competências 10, 11 e 12/2026 — está **correto** (confirmado).
+- **Não limpar** duplicatas históricas (as duas linhas em competências já vencidas — havia 52
+  casos entre 2017 e jul/2026): muitas são dois meses pagos no mesmo dia. Só listar se o
+  Ricardo pedir.
 
 ### 3c. Quando os dois processos colidem
 Sempre rodar 3a e 3b juntos por aba (não são excludentes). Se depois da limpeza de duplicatas
@@ -86,6 +116,21 @@ sobrar uma linha REC "solta" com data/valor que na verdade pertence a outra comp
 um pagamento de maio lançado por engano na linha de setembro, sem duplicata exata em outro
 lugar), NÃO tentar realocar sozinho — é o mesmo tipo de caso do Vinicius Finger. Perguntar ao
 Ricardo a que competência aquele valor se refere antes de mover.
+
+### 3d. Regras de clientes específicos (confirmadas, não perguntar de novo)
+- **Serviço avulso pago numa fatura separada sem linha de cobrança na aba** (ex.: DE LA VEGA,
+  R$ 1.621 em 15/10/2026): criar a cobrança e o recebimento — inserir 2 linhas logo depois da
+  última linha REC já vencida, com "SERVIÇO AVULSO" (C = valor) e "REC SERVIÇO AVULSO"
+  (D = valor), ambas com a data do pagamento; escrever a fórmula de saldo nas 2 linhas novas
+  e **corrigir a fórmula de saldo da linha seguinte**, que continua apontando para a linha
+  antiga depois da inserção.
+- **FAEGLE ARTIGOS ESPORTIVOS**: a abertura de CNPJ (R$ 1.300) é paga em parcelas de ~R$ 433;
+  não precisa lançar as parcelas — o saldo da aba vai diminuindo. Lançar só os honorários.
+- **LP ASSESSORIA EM SISTEMAS**: honorário mensal de R$ 299,00. Se faltarem linhas de
+  cobrança para competências novas, criar "HONORÁRIOS MMAAAA" (data = último dia do mês,
+  C = 299) + "REC HONORÁRIOS MMAAAA" até dezembro.
+- Se faltarem linhas de cobrança de competência em outro cliente, perguntar o valor antes de
+  criar.
 
 ## Passo 4 — Antes de aplicar: montar o plano
 Montar uma lista completa de mudanças (aba, linha, data antiga → nova, valor antigo → novo)
@@ -96,8 +141,24 @@ clientes ficaram de fora por ambiguidade (nome incerto, mais pagamentos que linh
 
 ## Passo 5 — Aplicar direto na planilha ao vivo
 Ricardo quer as correções feitas diretamente na planilha (não um arquivo à parte, não só um
-relatório). Método que funciona de forma confiável:
+relatório).
 
+### Método preferido (validado em 19/10/2026): conector Google Sheets
+- **Ler tudo de uma vez**: `get_spreadsheet` com `includeGridData: true` e `fields`
+  `["sheets.properties.title","sheets.properties.sheetId","sheets.properties.hidden",
+  "sheets.data.rowData.values.formattedValue"]`. O resultado (~1,4 MB) é salvo em arquivo —
+  processar em Python. Os nomes de aba vêm completos (sem o problema de 31 caracteres do .xlsx).
+- **Gravar em lote**: `update_spreadsheet` com requests `updateCells` célula a célula
+  (`start: {sheetId, rowIndex (0-based), columnIndex}`, `fields: "userEnteredValue"`).
+  ~130 requests por chamada funciona bem. Data como número serial
+  (dias desde 30/12/1899; ex. 09/10/2026 = 46304) — a coluna A já tem formato dd/MM/yyyy.
+  Valor como número. Para limpar: `values: [{}]` com `fields: "userEnteredValue"`.
+- Para inserir linhas: `insert_dimension` (ROWS, `inheritFromBefore: true`) e depois
+  `update_formulas` com as fórmulas de saldo (ver 3d).
+- Antes de gravar, reler a planilha e confirmar que não mudou desde a leitura do plano
+  (comparar o JSON); se mudou, refazer o plano.
+
+### Alternativa (se o conector não estiver disponível): Chrome
 - Usar o **Chrome real do usuário** (ferramentas `mcp__claude-in-chrome__*`), não o browser
   pane interno (`Claude_Browser`) — o pane interno já se mostrou pouco confiável (screenshots
   travando, cliques errando, `type` não funcionando). Carregar as tools via ToolSearch se
@@ -123,10 +184,9 @@ relatório). Método que funciona de forma confiável:
   correção nome-truncado → nome-real para qualquer nome de aba suspeito (≥30 caracteres).
 
 ## Passo 6 — Verificar
-Depois de aplicar um lote de edições, baixar uma cópia fresca da planilha via
-`Google_Drive__download_file_content` (exportMimeType xlsx) e comparar com o plano do Passo 4
-(célula por célula) para confirmar que tudo aplicou certo — não confiar só na ausência de erro
-do `browser_batch`. Isso também serve para detectar se o Ricardo editou algo manualmente ao
+Depois de aplicar, reler a planilha inteira (mesmo `get_spreadsheet` do Passo 5) e comparar com
+o plano do Passo 4 célula por célula, **e** comparar com a leitura anterior para confirmar que
+nenhuma outra célula das colunas A–D mudou — não confiar só no "success" da chamada. Isso também serve para detectar se o Ricardo editou algo manualmente ao
 mesmo tempo (nesse caso, nunca sobrescrever o que ele fez — perguntar).
 
 ## Passo 7 — Relatório final
@@ -136,8 +196,20 @@ extrato). Buscar em todas as abas (exceto as que começam com `*`, que são mode
 as linhas REC daquela competência com valor em branco. Excluir clientes já sabidamente
 inativos/encerrados se o Ricardo tiver indicado isso antes.
 
-Entregar essa lista como um arquivo .xlsx simples (Cliente | Competência | Vencimento) via
-SendUserFile.
+Excluir também: abas ocultas (clientes encerrados) e a aba LEGVITA (duplicada).
+
+Entregar essa lista como um arquivo .xlsx (Cliente | Competência | Vencimento | Valor |
+Saldo na aba | Observação, com total no fim) via SendUserFile. Na Observação, marcar os
+clientes que costumam pagar **direto no banco/caixa, fora do Asaas** (APADA, JAQUELINE RIBAS,
+LUIZA RIGO, MARCENARIA FITZ, LETÍCIA PARISE, ALINE SERAFIM, WURSTER, entre outros — ver a
+lista do ezmensal) — eles aparecem "em aberto" aqui só porque esses pagamentos não estão no
+extrato do Asaas.
+
+## Fórmula de saldo (coluna E)
+Padrão: `=E<linha anterior>-C<linha>+D<linha>` (cobrança diminui, recebimento aumenta; saldo
+negativo = cliente devendo). Se uma aba aparecer com saldo positivo depois de uma cobrança,
+conferir se a fórmula está invertida (`+C-D`) — foi o caso da SABRINA LA BELLA SILVA,
+corrigido em 19/10/2026.
 
 ## Regras gerais
 - Nunca aplicar uma mudança automática num cliente com ambiguidade real (nome incerto,
